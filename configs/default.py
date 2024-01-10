@@ -114,4 +114,23 @@ fine_model_and_render.update(dict(
     world_bound_scale=1.05,
 ))
 
+'''Template of color transform module
+'''
+color_transform_opt = dict(
+    net_depth = 1,
+    net_width = 64,
+    multires_color = 4,
+    lr = 5e-4,
+    use_rand_rgb_cycle_forward = True,
+    use_rand_rgb_cycle_backward = True,
+    use_train_image_cycle = True,
+    weight_rand_rgb_cycle_forward = 10.0,
+    weight_rand_rgb_cycle_backward = 100.0,
+    weight_train_image_cycle = 10000.0,
+    weight_rgb_photo = 1.0,
+    rand_color_batch=2**14,
+    pretrain_iters=1000,
+    rgbnet_out_dim=3,
+)
+
 del deepcopy

@@ -1,19 +1,24 @@
-import os, sys, copy, glob, json, time, random, argparse
+import argparse
+import copy
+import glob
+import json
+import os
+import random
+import sys
+import time
 from shutil import copyfile
-from tqdm import tqdm, trange
 
-import mmcv
 import imageio
+import mmcv
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from lib import utils, dvgo, dcvgo, dmpigo
+from lib import dcvgo, dmpigo, dvgo, utils
+from lib.color_transform_module import ColorTransformModule
 from lib.load_data import load_data
-
 from torch_efficient_distloss import flatten_eff_distloss
+from tqdm import tqdm, trange
 
 
 def config_parser():
@@ -59,7 +64,7 @@ def config_parser():
 
 
 @torch.no_grad()
-def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
+def render_viewpoints(model, ctm, render_poses, HW, Ks, ndc, render_kwargs,
                       gt_imgs=None, savedir=None, dump_images=False,
                       render_factor=0, render_video_flipy=False, render_video_rot90=0,
                       eval_ssim=False, eval_lpips_alex=False, eval_lpips_vgg=False):
@@ -81,6 +86,9 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
     lpips_alex = []
     lpips_vgg = []
 
+    if ctm:
+        rgbs_encode = []
+
     for i, c2w in enumerate(tqdm(render_poses)):
 
         H, W = HW[i]
@@ -101,6 +109,14 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
             k: torch.cat([ret[k] for ret in render_result_chunks]).reshape(H,W,-1)
             for k in render_result_chunks[0].keys()
         }
+
+        if ctm:
+            rgb_encode = render_result['rgb_marched'].cpu().numpy()
+            rgbs_encode.append(rgb_encode)
+            # handle unseen region only for evaluation time
+            render_result['rgb_marched'] = render_result['rgb_marched'] + render_result['alphainv_last'] * ctm.encode_color(torch.ones((1,3)) if cfg.data.white_bkgd else torch.zeros((1,3)))
+            render_result['rgb_marched'] = ctm.decode_color(render_result['rgb_marched'], requires_grad=False)
+            
         rgb = render_result['rgb_marched'].cpu().numpy()
         depth = render_result['depth'].cpu().numpy()
         bgmap = render_result['alphainv_last'].cpu().numpy()
@@ -298,7 +314,7 @@ def load_existed_model(args, cfg, cfg_train, reload_ckpt_path):
     return model, optimizer, start
 
 
-def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, data_dict, stage, coarse_ckpt_path=None):
+def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, data_dict, stage, coarse_ckpt_path=None, ctm=None):
     # init
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if abs(cfg_model.world_bound_scale - 1) > 1e-9:
@@ -337,7 +353,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
     render_kwargs = {
         'near': data_dict['near'],
         'far': data_dict['far'],
-        'bg': 1 if cfg.data.white_bkgd else 0,
+        'bg': 1 if (cfg.data.white_bkgd and not cfg.data.use_color_transform) else 0,
         'rand_bkgd': cfg.data.rand_bkgd,
         'stepsize': cfg_model.stepsize,
         'inverse_y': cfg.data.inverse_y,
@@ -394,6 +410,10 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
                 rays_o_tr, rays_d_tr, imsz, render_kwargs, cfg_train.maskout_lt_nviews)
 
     # GOGO
+    if ctm:
+        # pretrain color transform module with train images
+        ctm.pretrain(rgb_tr, 1 if cfg.data.white_bkgd else 0)
+
     torch.cuda.empty_cache()
     psnr_lst = []
     time0 = time.time()
@@ -450,7 +470,28 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
 
         # gradient descent step
         optimizer.zero_grad(set_to_none=True)
-        loss = cfg_train.weight_main * F.mse_loss(render_result['rgb_marched'], target)
+        loss = 0
+        if ctm:
+            ctm.optimizer.zero_grad(set_to_none=True)
+            if not cfg.data.rand_bkgd:
+                render_result['rgb_marched'] = render_result['rgb_marched'] + render_result['alphainv_last'].unsqueeze(-1) * ctm.encode_color(torch.ones((1,3)) if cfg.data.white_bkgd else torch.zeros((1,3)))
+
+            # rgb photometric loss
+            rgb = ctm.decode_color(render_result['rgb_marched'])
+            loss += ctm.weight_rgb_photo * F.mse_loss(rgb, target)
+
+            rgbper_rgb = ctm.decode_color(render_result['raw_rgb'])
+            rgbper_loss = ((rgbper_rgb - target[render_result['ray_id']]).pow(2).sum(-1) * render_result['weights'].detach()).sum() / len(rays_o)
+            loss += ctm.weight_rgb_photo * cfg_train.weight_rgbper * rgbper_loss
+
+            img_i = np.random.choice(len(rgb_tr))
+            train_image = rgb_tr[img_i].to(device) if cfg.data.load2gpu_on_the_fly else rgb_tr[img_i]
+            loss += ctm.identity_loss(target)
+
+            # encode target color to latent space
+            target = ctm.encode_color(target)
+
+        loss += cfg_train.weight_main * F.mse_loss(render_result['rgb_marched'], target)
         psnr = utils.mse2psnr(loss.detach())
         if cfg_train.weight_entropy_last > 0:
             pout = render_result['alphainv_last'].clamp(1e-6, 1-1e-6)
@@ -485,6 +526,8 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
                     cfg_train.weight_tv_k0/len(rays_o), global_step<cfg_train.tv_dense_before)
 
         optimizer.step()
+        if ctm:
+            ctm.optimizer.step()
         psnr_lst.append(psnr.item())
 
         # update lr
@@ -492,6 +535,10 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
         decay_factor = 0.1 ** (1/decay_steps)
         for i_opt_g, param_group in enumerate(optimizer.param_groups):
             param_group['lr'] = param_group['lr'] * decay_factor
+
+        if ctm:
+            for i_opt_g, param_group in enumerate(ctm.optimizer.param_groups):
+                param_group['lr'] = param_group['lr'] * decay_factor
 
         # check log & save
         if global_step%args.i_print==0:
@@ -510,6 +557,10 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }, path)
+            # TODO: save color transform module at different path
+            if ctm:
+                ctm_path = os.path.join(cfg.basedir, cfg.expname, f'color_transform_module.tar')
+                ctm.save_model(ctm_path)
             print(f'scene_rep_reconstruction ({stage}): saved checkpoints at', path)
 
     if global_step != -1:
@@ -519,10 +570,13 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
         }, last_ckpt_path)
+        if ctm:
+            ctm_path = os.path.join(cfg.basedir, cfg.expname, f'color_transform_module.tar')
+            ctm.save_model(ctm_path)
         print(f'scene_rep_reconstruction ({stage}): saved checkpoints at', last_ckpt_path)
 
 
-def train(args, cfg, data_dict):
+def train(args, cfg, data_dict, ctm):
 
     # init
     print('train: start')
@@ -542,7 +596,7 @@ def train(args, cfg, data_dict):
                 args=args, cfg=cfg,
                 cfg_model=cfg.coarse_model_and_render, cfg_train=cfg.coarse_train,
                 xyz_min=xyz_min_coarse, xyz_max=xyz_max_coarse,
-                data_dict=data_dict, stage='coarse')
+                data_dict=data_dict, stage='coarse', ctm=ctm)
         eps_coarse = time.time() - eps_coarse
         eps_time_str = f'{eps_coarse//3600:02.0f}:{eps_coarse//60%60:02.0f}:{eps_coarse%60:02.0f}'
         print('train: coarse geometry searching in', eps_time_str)
@@ -564,7 +618,7 @@ def train(args, cfg, data_dict):
             cfg_model=cfg.fine_model_and_render, cfg_train=cfg.fine_train,
             xyz_min=xyz_min_fine, xyz_max=xyz_max_fine,
             data_dict=data_dict, stage='fine',
-            coarse_ckpt_path=coarse_ckpt_path)
+            coarse_ckpt_path=coarse_ckpt_path, ctm=ctm)
     eps_fine = time.time() - eps_fine
     eps_time_str = f'{eps_fine//3600:02.0f}:{eps_fine//60%60:02.0f}:{eps_fine%60:02.0f}'
     print('train: fine detail reconstruction in', eps_time_str)
@@ -591,6 +645,13 @@ if __name__=='__main__':
 
     # load images / poses / camera settings / data split
     data_dict = load_everything(args=args, cfg=cfg)
+
+    ctm = None
+    if cfg.data.use_color_transform:
+        ctm = ColorTransformModule(device, **cfg.color_transform_opt)
+        ctm_ckpt_path = os.path.join(cfg.basedir, cfg.expname, 'color_transform_module.tar')
+        if os.path.exists(ctm_ckpt_path):
+            ctm.load_model(ctm_ckpt_path)
 
     # export scene bbox and camera poses in 3d for debugging and visualization
     if args.export_bbox_and_cams_only:
@@ -627,7 +688,7 @@ if __name__=='__main__':
 
     # train
     if not args.render_only:
-        train(args, cfg, data_dict)
+        train(args, cfg, data_dict, ctm)
 
     # load model for rendring
     if args.render_test or args.render_train or args.render_video:
@@ -646,11 +707,12 @@ if __name__=='__main__':
         stepsize = cfg.fine_model_and_render.stepsize
         render_viewpoints_kwargs = {
             'model': model,
+            'ctm': ctm,
             'ndc': cfg.data.ndc,
             'render_kwargs': {
                 'near': data_dict['near'],
                 'far': data_dict['far'],
-                'bg': 1 if cfg.data.white_bkgd else 0,
+                'bg': 1 if (cfg.data.white_bkgd and not cfg.data.use_color_transform) else 0,
                 'stepsize': stepsize,
                 'inverse_y': cfg.data.inverse_y,
                 'flip_x': cfg.data.flip_x,
@@ -688,8 +750,8 @@ if __name__=='__main__':
                 savedir=testsavedir, dump_images=args.dump_images,
                 eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
                 **render_viewpoints_kwargs)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
+        # imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        # imageio.mimwrite(os.path.join(testsavedir, 'video.depth.mp4'), utils.to8b(1 - depths / np.max(depths)), fps=30, quality=8)
 
     # render video
     if args.render_video:
